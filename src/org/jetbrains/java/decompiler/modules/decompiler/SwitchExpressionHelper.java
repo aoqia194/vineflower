@@ -44,8 +44,7 @@ public final class SwitchExpressionHelper {
     // So we need to figure out which variable, if any, this switch statement is an expression of and make it generate.
 
     Exprent condition = ((SwitchHeadExprent) stat.getHeadexprent()).getValue();
-    if (condition instanceof InvocationExprent) {
-      InvocationExprent invoc = (InvocationExprent) condition;
+    if (condition instanceof InvocationExprent invoc) {
       if (invoc.getName().equals("hashCode") && invoc.getClassname().equals("java/lang/String")) {
         return false; // We don't want to make switch expressions yet as switch processing hasn't happened
       }
