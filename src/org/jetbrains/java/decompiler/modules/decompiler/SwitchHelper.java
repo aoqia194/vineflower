@@ -195,95 +195,110 @@ public final class SwitchHelper {
     } else {
       StringSwitchResult result = isSwitchOnString(switchStatement);
       if (result != null) {
-        // Asserts not really needed, just in case is better than nothing maybe?
-        assert result.target != null;
+        // Contains the case value in the target switch to replace and a list of cases to replace with.
+        HashMap<Integer, List<Exprent>> caseMap = new HashMap<>();
+        for (int i = 0; i < switchStatement.getCaseStatements().size(); ++i) {
+          Statement currStat = switchStatement.getCaseStatements().get(i);
 
-        Map<Integer, Exprent> caseMap = new HashMap<>();
+          while (currStat instanceof IfStatement ifStat) {
+            Exprent condition = ifStat.getHeadexprent().getCondition();
+
+            if (condition instanceof FunctionExprent condFunc && condFunc.getFuncType() == FunctionType.NE) {
+              condition = condFunc.getLstOperands().get(0);
+            }
+
+            if (condition instanceof InvocationExprent condInvoc && condInvoc.getLstParameters().size() == 1) {
+              Exprent ifExpr = ifStat.getIfstat().getExprents().get(0);
+              Exprent realVal = condInvoc.getLstParameters().get(0);
+
+              List<Exprent> currValues = switchStatement.getCaseValues().get(i);
+
+              // Merged switches with an ExitExprent have the intermediate case values already
+              if (ifExpr instanceof AssignmentExprent assignExpr) {
+                int intermediate = ((ConstExprent) assignExpr.getRight()).getIntValue();
+                caseMap.computeIfAbsent(intermediate, k -> new ArrayList<>()).add(realVal);
+              } else if (ifExpr instanceof ExitExprent) {
+                // TODO(aoqia): Maybe don't need to loop here to account for multiple cases?
+                for (Exprent val : currValues) {
+                  int intermediate = ((ConstExprent) val).getIntValue();
+                  caseMap.computeIfAbsent(intermediate, k -> new ArrayList<>()).add(realVal);
+                }
+              }
+            }
+
+            currStat = ifStat.getElsestat();
+          }
+        }
 
         IfStatement containingNullCheck = null;
         if (result.type == StringSwitchResult.Type.SPLIT_NULLABLE) {
           assert result.nullAssignExpr != null;
           containingNullCheck = (IfStatement) switchStatement.getParent();
-        }
 
-        for (int i = 0; i < switchStatement.getCaseStatements().size(); ++i) {
-          Statement curr = switchStatement.getCaseStatements().get(i);
-
-          while (curr instanceof IfStatement ifStat)  {
-            Exprent condition = ifStat.getHeadexprent().getCondition();
-
-            if (condition instanceof FunctionExprent condFunction && condFunction.getFuncType() == FunctionType.NE) {
-              condition = condFunction.getLstOperands().get(0);
-            }
-
-            if (condition instanceof InvocationExprent condInvocation && condInvocation.getLstParameters().size() == 1) {
-              Exprent assign = ifStat.getIfstat().getExprents().get(0);
-              int caseVal = ((ConstExprent)((AssignmentExprent)assign).getRight()).getIntValue();
-              caseMap.put(caseVal, condInvocation.getLstParameters().get(0));
-            }
-
-            curr = ifStat.getElsestat();
-          }
-        }
-
-        if (result.type == StringSwitchResult.Type.SPLIT_NULLABLE) {
           // the else branch of the containing `if` will have an assignment exprent to get the null case from
           Statement elseBranch = containingNullCheck.getElsestat();
           AssignmentExprent assign = (AssignmentExprent) elseBranch.getExprents().get(0);
-          caseMap.put(((ConstExprent)assign.getRight()).getIntValue(), new ConstExprent(VarType.VARTYPE_NULL, null, null));
+
+          int oldVal = ((ConstExprent) assign.getRight()).getIntValue();
+          ConstExprent val = new ConstExprent(VarType.VARTYPE_NULL, null, null);
+          caseMap.computeIfAbsent(oldVal, k -> new ArrayList<>()).add(val);
         }
 
-        // Replace statement switch's case values with the original strings.
+        // Replace the target switch's case values with the correct case values.
+        // TODO(aoqia): Default block has extra null case value when case values get replaced.
         List<List<Exprent>> realCaseValues = result.target.getCaseValues().stream()
           .map(l -> l.stream()
-            .map(e -> e instanceof ConstExprent ? ((ConstExprent)e).getIntValue() : null)
-            .map(caseMap::get)
-            .collect(Collectors.toList()))
+            .filter(expr -> expr instanceof ConstExprent)
+            .map(expr -> ((ConstExprent) expr).getIntValue())
+            .filter(caseMap::containsKey)
+            .flatMap(i -> caseMap.get(i).stream())
+            .toList())
           .toList();
         result.target.getCaseValues().clear();
         result.target.getCaseValues().addAll(realCaseValues);
 
-        // Replace the statement switch's condition to the first's value.
-        Exprent followingVal = ((SwitchHeadExprent) result.target.getHeadexprent()).getValue();
-        result.target.getHeadexprent().replaceExprent(followingVal, ((InvocationExprent) value).getInstance());
+        // Replace the target switch statement's condition to the first's.
+        Exprent targetVal = ((SwitchHeadExprent) result.target.getHeadexprent()).getValue();
+        result.target.getHeadexprent().replaceExprent(targetVal, ((InvocationExprent) value).getInstance());
 
-        // Remove lingering variable that are now unused. This is typically the statement switch's condition.
-        // (the integer case value that is set in the first switch)
-        var first = switchStatement.getFirst();
-        List<Exprent> firstExprs = first.getExprents();
-        if (!firstExprs.isEmpty()) {
-          firstExprs.remove(firstExprs.size() - 1);
+        if (result.type != StringSwitchResult.Type.MERGED) {
+          // Remove lingering variable that are now unused. This is typically the switch statement's condition.
+          // (the integer case value that is set in the first switch)
+          var first = switchStatement.getFirst();
+          List<Exprent> firstExprs = first.getExprents();
+          if (!firstExprs.isEmpty()) {
+            firstExprs.remove(firstExprs.size() - 1);
+          }
+
+          // Remove all connecting edges from the lingering variable block.
+          first.getAllPredecessorEdges().forEach(first::removePredecessor);
+          first.getAllSuccessorEdges().forEach(first::removeSuccessor);
+
+          {
+            // The switch statement being in the default block has a parent sequence we want to keep.
+            Statement replacement = result.type == StringSwitchResult.Type.SPLIT_INLINED
+              ? result.target.getParent() : first;
+            replacement.getAllPredecessorEdges().forEach(replacement::removePredecessor);
+            switchStatement.replaceWith(replacement);
+          }
+
+          if (result.type == StringSwitchResult.Type.SPLIT_NULLABLE) {
+            // remove the containing `if` and not used edges
+            Statement replaced = containingNullCheck.replaceWithEmpty();
+            new HashSet<>(replaced.getLabelEdges())
+              .forEach(e -> {
+                result.target.removePredecessor(e);
+                e.removeClosure();
+              });
+          }
+
+          // Remove phantom references from old switch statement.
+          // Ignore the first statement as that has been extracted out of the switch.
+          result.target.getAllPredecessorEdges()
+            .stream()
+            .filter(e -> switchStatement.containsStatement(e.getSource()) && e.getSource() != first)
+            .forEach(e -> e.getSource().removeSuccessor(e));
         }
-
-        // Remove all connecting edges from the lingering variable block.
-        first.getAllPredecessorEdges().forEach(first::removePredecessor);
-        first.getAllSuccessorEdges().forEach(first::removeSuccessor);
-        {
-          // The statement switch being in the default block has a parent sequence which we want to keep.
-          Statement replacement = result.type == StringSwitchResult.Type.SPLIT_INLINED
-            ? result.target.getParent() : first;
-          replacement.getAllPredecessorEdges().forEach(replacement::removePredecessor);
-          switchStatement.replaceWith(replacement);
-        }
-
-        if (result.type == StringSwitchResult.Type.SPLIT_NULLABLE) {
-          // remove the containing `if`
-          Statement replaced = containingNullCheck.replaceWithEmpty();
-
-          // Replace unneeded edges left over from the replaced block
-          new HashSet<>(replaced.getLabelEdges())
-            .forEach(e -> {
-              result.target.removePredecessor(e);
-              e.removeClosure();
-            });
-        }
-
-        // Remove phantom references from old switch statement.
-        // Ignore the first statement as that has been extracted out of the switch.
-        result.target.getAllPredecessorEdges()
-          .stream()
-          .filter(e -> switchStatement.containsStatement(e.getSource()) && e.getSource() != first)
-          .forEach(e -> e.getSource().removeSuccessor(e));
 
         return true;
       }
@@ -556,7 +571,7 @@ public final class SwitchHelper {
    *   an else if chain. The body of the if block sets the switch variable for the
    *   following switch.
    * <p>
-   *   The statement switch block has the case statements of the original switch
+   *   The switch statement block has the case statements of the original switch
    *   and may also be inlined directly into the first switch's default block.
    * <p>
    *   It is not guaranteed to exist, for example if the cases return out of the switch statement.
@@ -585,10 +600,6 @@ public final class SwitchHelper {
   private static StringSwitchResult isSwitchOnString(SwitchStatement first) {
     StringSwitchResult result = findSecondStringSwitch(first);
 
-    if (result == null) {
-      return null;
-    }
-
     Exprent firstValue = ((SwitchHeadExprent) first.getHeadexprent()).getValue();
     if (!(firstValue instanceof InvocationExprent invExpr)
         || !invExpr.getName().equals("hashCode")
@@ -598,17 +609,14 @@ public final class SwitchHelper {
     }
 
     VarExprent varExpr = null;
-    if (result.type == StringSwitchResult.Type.SPLIT) {
-      // Should NEVER be null here because of split type, assert just in case.
-      assert result.target != null;
-
+    if (result != null && result.type != StringSwitchResult.Type.MERGED) {
       Exprent secondValue = ((SwitchHeadExprent) result.target.getHeadexprent()).getValue();
       if (!(secondValue instanceof VarExprent)) {
         return null;
       }
       varExpr = (VarExprent) secondValue;
 
-      if (result.nullAssignExpr != null && !result.nullAssignExpr.getLeft().equals(varExpr)) {
+      if (result.type == StringSwitchResult.Type.SPLIT_NULLABLE && !result.nullAssignExpr.getLeft().equals(varExpr)) {
         return null; // wrong assignment across `if`
       }
     }
@@ -623,7 +631,7 @@ public final class SwitchHelper {
         continue;
       }
 
-      // Validate case if/else blocks.
+      // Validate the case's if/else blocks.
       while (currStat != null) {
         if (!(currStat instanceof IfStatement ifStat)) {
           return null;
@@ -642,17 +650,21 @@ public final class SwitchHelper {
           return null;
         }
 
+        // Typically, string switches only have 1 statement inside the if (an assignment or exit)
         List<Exprent> block = ifStat.getIfstat().getExprents();
         if (block == null || block.size() != 1) {
           return null;
         }
 
-        // Single/merged string-switch always has return statements
-        if (result.type == StringSwitchResult.Type.MERGED && !isConstReturn(block.get(0))) {
+        // Single/merged string-switch always has a return statement
+        if (result != null && result.type == StringSwitchResult.Type.MERGED
+          && !isConstReturn(block.get(0))) {
           return null;
         }
-        // Split string-switch always has variable assignment statements
-        if (result.type != StringSwitchResult.Type.MERGED && !isConstAssignWithVar(block.get(0), varExpr)) {
+
+        // Split string-switch always has variable a assignment statement
+        if (result != null && result.type != StringSwitchResult.Type.MERGED
+          && !isConstAssignWithVar(block.get(0), varExpr)) {
           return null;
         }
 
@@ -662,12 +674,19 @@ public final class SwitchHelper {
       }
     }
 
+    // Switch may be merged (can't easily verify from findSecondStringSwitch)
+    // If all checks passed but there's no result, we can reasonably assume it's merged.
+    if (result == null) {
+      return new StringSwitchResult(StringSwitchResult.Type.MERGED, first, null);
+    }
+
     return result;
   }
 
   /**
    * Tries to find a related second switch statement from a given first switch.
    * In the case that the secondary string-switch is actually merged with the first switch, this will return null.
+   * <p>
    * It will look for specifically a switch statement that is either on the succeeding edge of the first switch,
    * or a switch statement that is inlined into the default case of the first switch.
    *
@@ -694,6 +713,7 @@ public final class SwitchHelper {
     }
 
     // Nullable string-switch
+    // NOTE(aoqia): Does this even exist anymore? I've yet to see something like this.
     if (first.getParent() instanceof IfStatement parent && !first.hasSuccessor(StatEdge.TYPE_REGULAR)) {
       Exprent ifCond = parent.getHeadexprent().getCondition();
       // and it's a null check with `else` branch,
@@ -743,14 +763,12 @@ public final class SwitchHelper {
       && exitExprent.getValue() instanceof ConstExprent;
   }
 
-  private record StringSwitchResult(Type type,
-                                    @Nullable SwitchStatement target,
-                                    @Nullable AssignmentExprent nullAssignExpr) {
+  private record StringSwitchResult(Type type, SwitchStatement target, @Nullable AssignmentExprent nullAssignExpr) {
     private enum Type {
       SPLIT,
       SPLIT_INLINED,
       SPLIT_NULLABLE,
       MERGED;
-    };
+    }
   }
 }
