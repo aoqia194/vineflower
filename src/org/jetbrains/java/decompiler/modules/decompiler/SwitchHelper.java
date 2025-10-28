@@ -199,7 +199,6 @@ public final class SwitchHelper {
         HashMap<Integer, List<Exprent>> caseMap = new HashMap<>();
         for (int i = 0; i < switchStatement.getCaseStatements().size(); ++i) {
           Statement currStat = switchStatement.getCaseStatements().get(i);
-
           while (currStat instanceof IfStatement ifStat) {
             Exprent condition = ifStat.getHeadexprent().getCondition();
 
@@ -216,12 +215,13 @@ public final class SwitchHelper {
               // Merged switches with an ExitExprent have the intermediate case values already
               if (ifExpr instanceof AssignmentExprent assignExpr) {
                 int intermediate = ((ConstExprent) assignExpr.getRight()).getIntValue();
-                caseMap.computeIfAbsent(intermediate, k -> new ArrayList<>()).add(realVal);
+                caseMap.computeIfAbsent(intermediate, ArrayList::new).add(realVal);
               } else if (ifExpr instanceof ExitExprent) {
-                // TODO(aoqia): Maybe don't need to loop here to account for multiple cases?
+                // TODO(aoqia): Maybe don't need to loop here to account for multiple cases? Test this.
+                // or maybe, both cases need this?
                 for (Exprent val : currValues) {
                   int intermediate = ((ConstExprent) val).getIntValue();
-                  caseMap.computeIfAbsent(intermediate, k -> new ArrayList<>()).add(realVal);
+                  caseMap.computeIfAbsent(intermediate, ArrayList::new).add(realVal);
                 }
               }
             }
@@ -241,19 +241,51 @@ public final class SwitchHelper {
 
           int oldVal = ((ConstExprent) assign.getRight()).getIntValue();
           ConstExprent val = new ConstExprent(VarType.VARTYPE_NULL, null, null);
-          caseMap.computeIfAbsent(oldVal, k -> new ArrayList<>()).add(val);
+          caseMap.computeIfAbsent(oldVal, ArrayList::new).add(val);
         }
 
-        // Replace the target switch's case values with the correct case values.
-        // TODO(aoqia): Default block has extra null case value when case values get replaced.
-        List<List<Exprent>> realCaseValues = result.target.getCaseValues().stream()
-          .map(l -> l.stream()
-            .filter(expr -> expr instanceof ConstExprent)
-            .map(expr -> ((ConstExprent) expr).getIntValue())
-            .filter(caseMap::containsKey)
-            .flatMap(i -> caseMap.get(i).stream())
-            .toList())
-          .toList();
+        List<List<Exprent>> realCaseValues = new ArrayList<>();
+        for (int i = 0; i < result.target.getCaseValues().size(); i++) {
+          ArrayList<Exprent> realCaseVal = new ArrayList<>();
+
+          List<Exprent> targetCaseVal = result.target.getCaseValues().get(i);
+          List<StatEdge> targetCaseEdges = result.target.getCaseEdges().get(i);
+
+          for (int j = 0; j < targetCaseVal.size(); j++) {
+            Exprent targetVal = targetCaseVal.get(j);
+            StatEdge targetEdge = targetCaseEdges.get(j);
+
+            Integer intermediate = targetVal instanceof ConstExprent e ? e.getIntValue() : null;
+            List<Exprent> realVal = caseMap.get(intermediate);
+
+            // If the real case value is null, it means this case wasn't linked between
+            //   both first and second switches and is thus an invalid case (can be safely removed).
+            // As noted from Jasmine (adf75bb):
+            //   If the second switch is a tableswitch, it can have a synthetic value that jumps to the default label
+            //   to fill out the table, even if this value is unreachable from the preceding switch.
+            //   See TestSwitchDefaultBefore for an example.
+            if (realVal == null) {
+              // Synthetic values jump to the same place always (default label).
+              if (targetEdge != result.target.getDefaultEdge()
+                && targetEdge.getDestination() == result.target.getDefaultEdge().getDestination()) {
+                targetCaseEdges.remove(j);
+                targetCaseVal.remove(j);
+                j--;
+              } else {
+                // Default case requires a case val with only null.
+                // TODO(aoqia): in the case where default is before a case, this wont register the other cases?
+                realCaseVal.add(null);
+              }
+
+              continue;
+            }
+
+            realCaseVal.addAll(realVal);
+          }
+
+          realCaseValues.add(realCaseVal);
+        }
+
         result.target.getCaseValues().clear();
         result.target.getCaseValues().addAll(realCaseValues);
 
@@ -686,9 +718,6 @@ public final class SwitchHelper {
   /**
    * Tries to find a related second switch statement from a given first switch.
    * In the case that the secondary string-switch is actually merged with the first switch, this will return null.
-   * <p>
-   * It will look for specifically a switch statement that is either on the succeeding edge of the first switch,
-   * or a switch statement that is inlined into the default case of the first switch.
    *
    * @param first original switch to search from
    * @return a result object containing the type of the string-switch statement, the target (second) string-switch
@@ -713,7 +742,6 @@ public final class SwitchHelper {
     }
 
     // Nullable string-switch
-    // NOTE(aoqia): Does this even exist anymore? I've yet to see something like this.
     if (first.getParent() instanceof IfStatement parent && !first.hasSuccessor(StatEdge.TYPE_REGULAR)) {
       Exprent ifCond = parent.getHeadexprent().getCondition();
       // and it's a null check with `else` branch,
@@ -742,6 +770,7 @@ public final class SwitchHelper {
 
   /**
    * Checks that the given exprent is a const assignment and that the assignment variable matches the var exprent.
+   *
    * @param expr exprent to check
    * @param varExpr var exprent to check
    * @return true if matched otherwise false
@@ -754,6 +783,7 @@ public final class SwitchHelper {
 
   /**
    * Checks that the given exprent is a return with a constant value.
+   *
    * @param expr exprent to check
    * @return true if matched otherwise false
    */
@@ -765,10 +795,24 @@ public final class SwitchHelper {
 
   private record StringSwitchResult(Type type, SwitchStatement target, @Nullable AssignmentExprent nullAssignExpr) {
     private enum Type {
+      /*
+       * The standard type of string-switch structure. Contains two consecutive switch statements where the first
+       *   switch yields an intermediate case index variable that is used by the second switch
+       */
       SPLIT,
+      /*
+       * The same as SPLIT except the second switch is inlined into the first switch's default case block.
+       */
       SPLIT_INLINED,
+      /*
+       * This is suspected to be a Java 17 preview feature that isn't really seen anymore.
+       */
       SPLIT_NULLABLE,
-      MERGED;
+      /*
+       * Similar to SPLIT but the first switch contains all the necessary information, so a second isn't needed.
+       *   The target statement is therefore the first switch.
+       */
+      MERGED,
     }
   }
 }
